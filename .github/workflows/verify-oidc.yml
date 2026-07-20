@@ -1,0 +1,24 @@
+name: verify-oidc
+
+# Throwaway proof for the Phase 1 Definition of Done: a GitHub Actions job assumes
+# the CI role via OIDC and prints the assumed identity. Manual trigger only, since
+# this is a one-time check and not part of the pipeline.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # required for GitHub to mint the OIDC token
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assume the CI role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::646278323015:role/retrain-pipeline-ci
+          aws-region: us-east-1
+
+      - name: Prove it worked
+        run: aws sts get-caller-identity
