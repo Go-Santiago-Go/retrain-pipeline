@@ -28,6 +28,10 @@ training/expectations/uncommitted/
 training/model/
 metrics.json
 
-# Private planning and operating docs, not for the public repo
+# Private planning, operating, and study docs, not for the public repo
 CLAUDE.local.md
 PROJECT_BUILD_PLAN.md
+content/
+
+# Editor config, personal not project
+.vscode/
