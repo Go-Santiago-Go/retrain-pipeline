@@ -1,0 +1,33 @@
+# Go
+/bin/
+# Leading slash anchors this to the repo root so it matches only a stray compiled
+# binary, not the cmd/trainctl/ source directory.
+/trainctl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Terraform
+# State can contain resource attributes that are effectively secrets, and remote
+# state in S3 is the source of truth regardless. Never let local state be committed.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+# .terraform.lock.hcl is deliberately NOT ignored: it pins provider versions so CI
+# and local runs resolve identically. It is a lockfile, same as go.sum.
+
+# Great Expectations local run output; the suite itself is committed, results are not
+training/expectations/uncommitted/
+
+# Local model output; the real artifacts live in S3
+training/model/
+metrics.json
+
+# Private planning and operating docs, not for the public repo
+CLAUDE.local.md
+PROJECT_BUILD_PLAN.md
