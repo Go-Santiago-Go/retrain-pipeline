@@ -1,11 +1,11 @@
 name: quality-gate
 
-# Runs before merge on any PR that changes the dataset. Code-only PRS never
-# trigger it, so the gate stays cheap
+# Runs on every PR so this check always reports a status. A path filter here
+# would skip code-only PRs, and a required check that never runs stays pending
+# forever, blocking the merge. Instead the job runs always and a native git
+# diff (below) decides whether to do the expensive validation.
 on:
   pull_request:
-    paths:
-      - 'data/**'
 
 permissions:
   contents: read
@@ -17,52 +17,76 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 brings full history so the diff below can compare the
+      # PR head against the base branch tip. The default shallow clone can't.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Decide once whether this PR touches the dataset. Every heavy step is
+      # gated on this output, so a code-only PR skips straight to a green
+      # check. Native git diff on purpose: this job holds id-token: write, so
+      # we keep third-party actions out of the privileged path.
+      - name: Detect whether the dataset changed
+        id: changed
+        run: |
+          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -q '^data/'; then
+            echo "data=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no data changes in this PR; gate passes trivially"
+            echo "data=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/setup-python@v5
+        if: steps.changed.outputs.data == 'true'
         with:
           python-version: '3.12'
 
       # Exchanges the OIDC token for temporary creds via the CI role's trust
       # policy, then exports them so boto3 (and dvc) pick them up.
       - name: Configure AWS credentials via OIDC
+        if: steps.changed.outputs.data == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::646278323015:role/retrain-pipeline-ci
           aws-region: us-east-1
       
       - name: Install the suite's dependencies
+        if: steps.changed.outputs.data == 'true'
         run: pip install -r training/requirements.txt
 
       # Pinned to the version used locally so CI resolves the same bytes the
       # same way. The [s3] extra pulls in boto3 for the remote.
       - name: Install DVC
+        if: steps.changed.outputs.data == 'true'
         run: pip install 'dvc[s3]==3.67.1'
 
       # The pointer is in Git; the bytes are not. Resolve the hash and fetch
       # the exact CSV from S3 so validate.py has real data to open. Scoped to
       # train.csv because the gate validates only that file.
       - name: Fetch the dataset from the DVC remote
+        if: steps.changed.outputs.data == 'true'
         run: dvc pull data/train.csv.dvc
       
       # validate.py exits nonzero on any failed expectation. That exit code
       # is the gate: a red step here blocks the merge once branch protection
       # makes the check required
       - name: Run the data quality gate
+        if: steps.changed.outputs.data == 'true'
         run: python training/validate.py data/train.csv
 
       # Runs even when validation fails, so the failing PR carries its own
       # quarantine record. Without always(), a red gate uploads nothing and
       # the contributor is left guessing.
       - name: Upload the validation report
-        if: always()
+        if: always() && steps.changed.outputs.data == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: gx-validation-result
           path: training/validation-result.json
 
       - name: Summarize a failure on the PR
-        if: failure()
+        if: failure() && steps.changed.outputs.data == 'true'
         run: |
           {
             echo "### ❌ Data quality gate failed"
