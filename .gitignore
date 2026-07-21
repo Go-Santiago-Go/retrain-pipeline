@@ -10,6 +10,14 @@ __pycache__/
 .venv/
 venv/
 
+# Data
+# Raw source is re-downloadable from UCI, and the generated splits become
+# DVC-managed in Phase 4 (a tiny .dvc pointer lands in git, the bytes in S3).
+# Committing the CSVs here would version the same data twice. .dvc pointers
+# are not matched below, so they stay tracked once DVC exists.
+/data/raw/
+/data/*.csv
+
 # Terraform
 # State can contain resource attributes that are effectively secrets, and remote
 # state in S3 is the source of truth regardless. Never let local state be committed.
