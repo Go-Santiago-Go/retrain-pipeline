@@ -11,9 +11,10 @@ tagged with the dataset hash and Git SHA, then registers the result in the SageM
 as `PendingManualApproval` with its eval metrics attached. Nothing ships until a human reads the
 metrics and approves.
 
-> **Status:** in development. Phase 1 (AWS infrastructure) is provisioned and verified, and Phase 2
-> (dataset and dual-mode training script) trains locally against the frozen holdout. The quality-gate,
-> DVC versioning, and governance phases are in progress.
+> **Status:** in development. Phases 1 to 4 are complete: AWS infrastructure is provisioned and
+> verified, the dual-mode training script trains against the frozen holdout, the Great Expectations
+> quality gate is an enforced required check on `main`, and DVC versions the dataset in an S3 remote.
+> The training-submission and governance phases (`trainctl`, SageMaker, Model Registry) are next.
 
 ## Architecture
 
@@ -44,7 +45,7 @@ not event-driven. There is no queue and no event bus in this design.
 | `training/` | `train.py` (dual-mode local/SageMaker), `split_dataset.py` (one-shot holdout carve), and `validate.py` (the Great Expectations quality-gate suite) |
 | `cmd/trainctl/` | Go CLI: `submit` and `register` |
 | `data/` | DVC pointer files only, never the data itself |
-| `.github/workflows/` | `quality-gate` (on data PRs) and `train` (on merge to main) |
+| `.github/workflows/` | `quality-gate` (every PR; full validation only when data changes) and `train` (on merge to main) |
 
 ## Infrastructure
 
@@ -93,7 +94,7 @@ Run it locally:
 python -m venv .venv && source .venv/bin/activate
 pip install -r training/requirements.txt
 
-# fetch the raw dataset (gitignored and re-downloadable; DVC replaces this in Phase 4)
+# fetch the raw dataset (gitignored and re-downloadable; the split CSVs are DVC-managed)
 mkdir -p data/raw
 curl -sL "https://archive.ics.uci.edu/static/public/228/sms+spam+collection.zip" -o data/raw/smsspam.zip
 unzip -o data/raw/smsspam.zip -d data/raw/
@@ -105,6 +106,41 @@ python training/train.py           # trains, evaluates, writes metrics.json
 The current local baseline on the frozen holdout is accuracy 0.97, precision 1.00, recall 0.81, F1
 0.90. Precision and recall are reported separately because for a spam filter their costs differ: a
 false positive junks a real message, while a false negative merely lets one spam through.
+
+## Data versioning
+
+The dataset is versioned with [DVC](https://dvc.org). Git tracks only small `.dvc` pointer files (an
+MD5 hash, a size, and a path); the CSV bytes live content-addressed in an S3 remote. That hash is the
+dataset's version identity, and it travels to the training job and the model registry as lineage.
+
+The contributor loop is run by a human, locally:
+
+```bash
+# 1. add or replace labeled rows in data/train.csv, then
+
+# 2. re-hash the file and push its bytes to the S3 remote
+dvc add data/train.csv
+dvc push
+
+# 3. commit the pointer, not the data, and open a PR
+git add data/train.csv.dvc
+git commit -m "data: add N labeled messages"
+git push
+```
+
+The PR carries only the changed pointer. CI never runs `dvc add` or `dvc push`; it only ever runs
+`dvc pull` to fetch the exact bytes a hash names, then validates them. Automating `dvc add` in CI
+would mean CI committing to `main`, the anti-pattern this design avoids: humans propose data, the gate
+and a human dispose. Any dataset version is recoverable later in two commands, `git checkout
+dataset-<hash> && dvc pull`.
+
+**The quality gate.** `quality-gate` runs on every pull request. A native `git diff` decides whether
+the PR touches `data/**`: a data PR gets the full validation (assume the CI role via OIDC, `dvc pull`,
+run the Great Expectations suite), while a code-only PR skips straight to a green check. Running on
+every PR rather than filtering by path is deliberate. A path-filtered required check never reports on
+a code-only PR, leaving it unmergeable forever; running always and branching inside keeps the check
+honest for every PR shape. The suite is a required check on `main` with admin enforcement, so a batch
+that fails validation cannot merge.
 
 ## Related projects
 
