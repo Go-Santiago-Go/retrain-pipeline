@@ -1,0 +1,50 @@
+name: quality-gate
+
+# Runs before merge on any PR that changes the dataset. Code-only PRS never
+# trigger it, so the gate stays cheap
+on:
+  pull_request:
+    paths:
+      - 'data/**'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install the suite's dependencies
+        run: pip install -r training/requirements.txt
+      
+      # validate.py exits nonzero on any failed expectation. That exit code
+      # is the gate: a red step here blocks the merge once branch protection
+      # makes the check required
+      - name: Run the data quality gate
+        run: python training/validate.py data/train.csv
+
+      # Runs even when validation fails, so the failing PR carries its own
+      # quarantine record. Without always(), a red gate uploads nothing and
+      # the contributor is left guessing.
+      - name: Upload the validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gx-validation-result
+          path: training/validation-result.json
+
+      - name: Summarize a failure on the PR
+        if: failure()
+        run: |
+          {
+            echo "### ❌ Data quality gate failed"
+            echo ""
+            echo "This batch violated the data contract. Download the **gx-validation-result** artifact for the per-expectation report."
+          } >> "$GITHUB_STEP_SUMMARY"
+           
