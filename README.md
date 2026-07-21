@@ -41,7 +41,7 @@ not event-driven. There is no queue and no event bus in this design.
 | Path | Contents |
 |---|---|
 | `terraform/` | Buckets, IAM roles, GitHub OIDC provider, model package group |
-| `training/` | `train.py` (dual-mode local/SageMaker), `split_dataset.py` (one-shot holdout carve), and the Great Expectations suite |
+| `training/` | `train.py` (dual-mode local/SageMaker), `split_dataset.py` (one-shot holdout carve), and `validate.py` (the Great Expectations quality-gate suite) |
 | `cmd/trainctl/` | Go CLI: `submit` and `register` |
 | `data/` | DVC pointer files only, never the data itself |
 | `.github/workflows/` | `quality-gate` (on data PRs) and `train` (on merge to main) |

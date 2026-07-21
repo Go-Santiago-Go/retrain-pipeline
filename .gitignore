@@ -31,6 +31,7 @@ venv/
 
 # Great Expectations local run output; the suite itself is committed, results are not
 training/expectations/uncommitted/
+training/validation-result.json
 
 # Local model output; the real artifacts live in S3
 training/model/
