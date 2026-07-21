@@ -9,6 +9,9 @@ on:
 
 permissions:
   contents: read
+  # Mint the OIDC token STS exchanges for short-lived role credentials. Without
+  # this the job cannot get a token and dvc pull has no way to reach S3.
+  id-token: write
 
 jobs:
   validate:
@@ -19,9 +22,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      # Exchanges the OIDC token for temporary creds via the CI role's trust
+      # policy, then exports them so boto3 (and dvc) pick them up.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::646278323015:role/retrain-pipeline-ci
+          aws-region: us-east-1
       
       - name: Install the suite's dependencies
         run: pip install -r training/requirements.txt
+
+      # Pinned to the version used locally so CI resolves the same bytes the
+      # same way. The [s3] extra pulls in boto3 for the remote.
+      - name: Install DVC
+        run: pip install 'dvc[s3]==3.67.1'
+
+      # The pointer is in Git; the bytes are not. Resolve the hash and fetch
+      # the exact CSV from S3 so validate.py has real data to open. Scoped to
+      # train.csv because the gate validates only that file.
+      - name: Fetch the dataset from the DVC remote
+        run: dvc pull data/train.csv.dvc
       
       # validate.py exits nonzero on any failed expectation. That exit code
       # is the gate: a red step here blocks the merge once branch protection
