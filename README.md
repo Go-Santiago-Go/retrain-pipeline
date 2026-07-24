@@ -11,10 +11,12 @@ tagged with the dataset hash and Git SHA, then registers the result in the SageM
 as `PendingManualApproval` with its eval metrics attached. Nothing ships until a human reads the
 metrics and approves.
 
-> **Status:** in development. Phases 1 to 4 are complete: AWS infrastructure is provisioned and
+> **Status:** in development. Phases 1 to 5 are complete: AWS infrastructure is provisioned and
 > verified, the dual-mode training script trains against the frozen holdout, the Great Expectations
-> quality gate is an enforced required check on `main`, and DVC versions the dataset in an S3 remote.
-> The training-submission and governance phases (`trainctl`, SageMaker, Model Registry) are next.
+> quality gate is an enforced required check on `main`, DVC versions the dataset in an S3 remote, and
+> the `trainctl` CLI submits a SageMaker training job and watches it to completion. This is validated
+> live end to end: a real job reached `Completed` and wrote a versioned `model.tar.gz`. The governance
+> phase (`trainctl register`, SageMaker Model Registry) is next.
 
 ## Architecture
 
@@ -141,6 +143,54 @@ every PR rather than filtering by path is deliberate. A path-filtered required c
 a code-only PR, leaving it unmergeable forever; running always and branching inside keeps the check
 honest for every PR shape. The suite is a required check on `main` with admin enforcement, so a batch
 that fails validation cannot merge.
+
+## Training submission
+
+Merging approved data to `main` triggers the `train` workflow, which authenticates as the CI role
+through OIDC (no stored keys), `dvc pull`s the exact dataset the commit points at, stages the code and
+CSVs into the artifacts bucket, and runs `trainctl submit`.
+
+`trainctl submit` takes three identifiers (`--execution-role`, `--image`, `--bucket`) and derives the
+rest. The dataset hash, read from the `.dvc` pointer, builds both the idempotent job name
+(`retrain-pipeline-<hash8>-<sha7>`) and the immutable input prefix, so the same data and commit always
+resolve to the same job. SageMaker rejects a duplicate name, which is the idempotency guarantee: an
+unchanged dataset and commit cannot launch a second job. The CLI then polls `DescribeTrainingJob`
+until the job reaches a terminal state and returns a nonzero exit on anything but `Completed`, turning
+a failed run into a red CI check.
+
+The container runs the AWS-managed sklearn image (1.4) while local development uses a newer sklearn.
+The TF-IDF plus LogisticRegression APIs are stable across that gap, so the identical `train.py` runs in
+both; `requirements.txt` is deliberately not shipped to the container, so it keeps its pinned runtime.
+
+### Design Q&A
+
+**How does the workflow authenticate to AWS with no credentials in the repo or in secrets?**
+Through GitHub OIDC federation. When the job runs, GitHub Actions mints a short-lived, signed JSON
+Web Token whose claims name this repository and the branch it ran on. The job requests that token by
+declaring `id-token: write`. The `configure-aws-credentials` action hands the token to AWS STS via
+`AssumeRoleWithWebIdentity`. STS verifies the signature against the GitHub OIDC provider registered in
+the account, then checks the CI role's trust policy conditions (this repository, `main`). On a match it
+returns temporary credentials scoped to the job's lifetime. Nothing long-lived is ever stored; the
+trust is federated and minted fresh per run.
+
+**Why derive the training job name from the dataset hash and Git SHA instead of listing existing jobs
+and skipping if one matches?** Because the derived name makes SageMaker itself enforce idempotency.
+The name is a deterministic function of the data and the commit, and SageMaker rejects a duplicate job
+name, so resubmitting the same inputs fails at the service with no extra logic. A check-then-act
+approach (list jobs, skip if found) carries a time-of-check-to-time-of-use race: two concurrent merges
+could both see no match and both submit. It also costs an extra API call and more code. Pushing the
+uniqueness check to the server is atomic, race-free, and simpler, and the name doubles as human-readable
+provenance for which data and commit produced the job.
+
+**Why two IAM roles rather than one?** Separation of privilege. The CI role only needs to start jobs
+and pass the execution role to SageMaker; the execution role is what the job assumes to read input and
+write model artifacts. A single combined role would hand anyone who could trigger CI, or who
+compromised the runner, the union of both: the power to launch jobs and to read and write the
+model-artifacts bucket directly. Splitting them means a compromised runner can only launch a job that
+runs as the tightly scoped execution role, never touch artifacts itself. The CI role's `iam:PassRole`
+is scoped to that one execution role and to SageMaker alone, which closes the escalation path where CI
+could pass a more privileged role. The attack prevented is privilege escalation from a compromised CI
+pipeline into the model store.
 
 ## Related projects
 
