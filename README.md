@@ -11,10 +11,12 @@ tagged with the dataset hash and Git SHA, then registers the result in the SageM
 as `PendingManualApproval` with its eval metrics attached. Nothing ships until a human reads the
 metrics and approves.
 
-> **Status:** in development. Phases 1 to 4 are complete: AWS infrastructure is provisioned and
+> **Status:** in development. Phases 1 to 5 are complete: AWS infrastructure is provisioned and
 > verified, the dual-mode training script trains against the frozen holdout, the Great Expectations
-> quality gate is an enforced required check on `main`, and DVC versions the dataset in an S3 remote.
-> The training-submission and governance phases (`trainctl`, SageMaker, Model Registry) are next.
+> quality gate is an enforced required check on `main`, DVC versions the dataset in an S3 remote, and
+> the `trainctl` CLI submits a SageMaker training job and watches it to completion. This is validated
+> live end to end: a real job reached `Completed` and wrote a versioned `model.tar.gz`. The governance
+> phase (`trainctl register`, SageMaker Model Registry) is next.
 
 ## Architecture
 
@@ -141,6 +143,24 @@ every PR rather than filtering by path is deliberate. A path-filtered required c
 a code-only PR, leaving it unmergeable forever; running always and branching inside keeps the check
 honest for every PR shape. The suite is a required check on `main` with admin enforcement, so a batch
 that fails validation cannot merge.
+
+## Training submission
+
+Merging approved data to `main` triggers the `train` workflow, which authenticates as the CI role
+through OIDC (no stored keys), `dvc pull`s the exact dataset the commit points at, stages the code and
+CSVs into the artifacts bucket, and runs `trainctl submit`.
+
+`trainctl submit` takes three identifiers (`--execution-role`, `--image`, `--bucket`) and derives the
+rest. The dataset hash, read from the `.dvc` pointer, builds both the idempotent job name
+(`retrain-pipeline-<hash8>-<sha7>`) and the immutable input prefix, so the same data and commit always
+resolve to the same job. SageMaker rejects a duplicate name, which is the idempotency guarantee: an
+unchanged dataset and commit cannot launch a second job. The CLI then polls `DescribeTrainingJob`
+until the job reaches a terminal state and returns a nonzero exit on anything but `Completed`, turning
+a failed run into a red CI check.
+
+The container runs the AWS-managed sklearn image (1.4) while local development uses a newer sklearn.
+The TF-IDF plus LogisticRegression APIs are stable across that gap, so the identical `train.py` runs in
+both; `requirements.txt` is deliberately not shipped to the container, so it keeps its pinned runtime.
 
 ## Related projects
 
