@@ -1,0 +1,91 @@
+name: train
+
+# Fires only after new data is reviewed, passes the quality gate, and merges to
+# main. push (not pull_request) means we train the approved dataset, never an
+# unmerged one. The path filter is the money gate: a training job bills and burns
+# quota, so a code-only merge (README, Go refactor) must never launch one. This
+# is a post-merge job, not a required PR check, so a path filter here cannot
+# deadlock anything the way it would on the quality-gate.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'data/**'
+
+permissions:
+  contents: read
+  # Mint the OIDC token STS exchanges for short-lived CI-role credentials. No
+  # long-lived key is stored anywhere; this is the entire auth story.
+  id-token: write
+
+# Non-secret identifiers, derived from Terraform outputs and kept inline for the
+# same reason the quality-gate keeps its role ARN inline: they are public names,
+# not credentials, and belong in version control where a reviewer can see them.
+env:
+  ARTIFACTS_BUCKET: retrain-pipeline-model-artifacts-646278323015
+  EXECUTION_ROLE: arn:aws:iam::646278323015:role/retrain-pipeline-sagemaker-execution
+  SKLEARN_IMAGE: 683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.4-2-cpu-py3
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Version comes from go.mod, so there is one source of truth and CI follows
+      # a toolchain bump automatically.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Trades the OIDC token for temporary CI-role creds and exports them, so
+      # dvc and the aws CLI below authenticate with no stored key.
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::646278323015:role/retrain-pipeline-ci
+          aws-region: us-east-1
+
+      # Pinned to the version used locally and by the quality-gate so every leg
+      # resolves the same bytes the same way. The [s3] extra pulls in boto3.
+      - name: Install DVC
+        run: pip install 'dvc[s3]==3.67.1'
+
+      # The pointers are in Git; the bytes are not. Resolve both the training set
+      # and the frozen holdout from the remote so they can be staged for the job.
+      - name: Fetch the dataset from the DVC remote
+        run: dvc pull data/train.csv.dvc data/holdout.csv.dvc
+
+      # Script mode: SageMaker runs a stock sklearn container and injects our
+      # code. train.py must sit at the archive root. requirements.txt is
+      # deliberately excluded so the container keeps its own sklearn rather than
+      # pip-installing our newer local pin over it.
+      - name: Package and upload the training code
+        run: |
+          tar -czf sourcedir.tar.gz -C training train.py
+          aws s3 cp sourcedir.tar.gz "s3://${ARTIFACTS_BUCKET}/code/sourcedir.tar.gz"
+
+      # SageMaker reads real CSVs from the artifacts bucket, not DVC's
+      # content-addressed blobs, so the pulled files are staged under a
+      # hash-namespaced prefix. The hash is read from the same committed .dvc
+      # pointer the CLI derives the job name from: one source of truth, and the
+      # input prefix is immutable per dataset version.
+      - name: Stage the dataset for SageMaker
+        run: |
+          HASH=$(grep -m1 'md5:' data/train.csv.dvc | tr -d ' ' | cut -d: -f2)
+          aws s3 cp data/train.csv   "s3://${ARTIFACTS_BUCKET}/input/${HASH}/train.csv"
+          aws s3 cp data/holdout.csv "s3://${ARTIFACTS_BUCKET}/input/${HASH}/holdout.csv"
+
+      - name: Build trainctl
+        run: go build -o trainctl ./cmd/trainctl
+
+      # The CLI derives the job name, the input prefix (bucket + hash), and the
+      # request from --bucket, then submits and polls to a terminal state. A
+      # non-Completed job returns a nonzero exit, which fails this step and turns
+      # the run red: the CI feedback loop the poller was built for.
+      - name: Submit and watch the training job
+        run: |
+          ./trainctl submit \
+            --execution-role "${EXECUTION_ROLE}" \
+            --image "${SKLEARN_IMAGE}" \
+            --bucket "${ARTIFACTS_BUCKET}"
