@@ -25,6 +25,7 @@ env:
   ARTIFACTS_BUCKET: retrain-pipeline-model-artifacts-646278323015
   EXECUTION_ROLE: arn:aws:iam::646278323015:role/retrain-pipeline-sagemaker-execution
   SKLEARN_IMAGE: 683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.4-2-cpu-py3
+  MODEL_PACKAGE_GROUP: retrain-pipeline-models
 
 jobs:
   train:
@@ -89,3 +90,18 @@ jobs:
             --execution-role "${EXECUTION_ROLE}" \
             --image "${SKLEARN_IMAGE}" \
             --bucket "${ARTIFACTS_BUCKET}"
+
+      # A separate step, not a flag on submit. Actions only runs it if submit
+      # exited zero, so a failed training job can never register a model, and the
+      # two concerns stay separately readable in the log. It also means a
+      # registration that fails on a permissions detail can be re-run by hand
+      # against the completed job without paying for training again.
+      #
+      # No --bucket: register derives the artifact location from the training
+      # job itself and publishes metrics beside it. The same image trains and
+      # serves, because the managed sklearn container ships both entry points.
+      - name: Register the model pending human approval
+        run: |
+          ./trainctl register \
+            --group "${MODEL_PACKAGE_GROUP}" \
+            --image "${SKLEARN_IMAGE}"
