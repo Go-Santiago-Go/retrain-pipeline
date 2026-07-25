@@ -11,12 +11,17 @@ tagged with the dataset hash and Git SHA, then registers the result in the SageM
 as `PendingManualApproval` with its eval metrics attached. Nothing ships until a human reads the
 metrics and approves.
 
-> **Status:** in development. Phases 1 to 5 are complete: AWS infrastructure is provisioned and
-> verified, the dual-mode training script trains against the frozen holdout, the Great Expectations
-> quality gate is an enforced required check on `main`, DVC versions the dataset in an S3 remote, and
-> the `trainctl` CLI submits a SageMaker training job and watches it to completion. This is validated
-> live end to end: a real job reached `Completed` and wrote a versioned `model.tar.gz`. The governance
-> phase (`trainctl register`, SageMaker Model Registry) is next.
+> **Status:** the loop is closed and has been demonstrated live, end to end. AWS infrastructure is
+> provisioned in Terraform, the dual-mode training script trains against the frozen holdout, the Great
+> Expectations quality gate is an enforced required check on `main`, DVC versions the dataset in an S3
+> remote, and the `trainctl` CLI submits a SageMaker training job, watches it to completion, and
+> registers the result in the Model Registry as `PendingManualApproval` with its metrics and lineage
+> attached.
+>
+> A batch that fails validation was blocked at the gate. A batch that passes was merged, trained job
+> `retrain-pipeline-ce0d529b-c36d27a` to `Completed`, and registered as version 1. A human read the
+> metrics, verified the lineage back to the commit and the dataset hash, and approved it with a stated
+> reason. Nothing in that sequence was simulated.
 
 ## Architecture
 
@@ -74,7 +79,9 @@ multipart uploads. State is versioned; the two write-once application buckets ar
 ## Dataset and training
 
 The dataset is the [UCI SMS Spam Collection](https://archive.ics.uci.edu/dataset/228/sms+spam+collection):
-5,574 real English text messages, each labeled `ham` or `spam`, roughly 87/13.
+5,574 real English text messages, each labeled `ham` or `spam`, roughly 87/13. A further 24 hand
+written messages entered later through the pipeline itself, as the labeled batch that exercised the
+gate, the training job, and the registry end to end.
 
 Before any model trains, `training/split_dataset.py` carves a **frozen holdout** once: a stratified 20
 percent split under a fixed seed, written to `data/holdout.csv` and never regenerated. The holdout is
@@ -126,7 +133,7 @@ dvc push
 
 # 3. commit the pointer, not the data, and open a PR
 git add data/train.csv.dvc
-git commit -m "data: add N labeled messages"
+git commit -m "feat(data): add N labeled messages"
 git push
 ```
 
@@ -290,6 +297,31 @@ baseline with no incumbent.
 `DescribeModelPackage`, and `ListModelPackages`, and deliberately not `UpdateModelPackage`. CI can
 therefore propose a version and read the registry, but it structurally cannot approve one. Promotion
 requires a principal that CI is not.
+
+### The demonstrated run
+
+A batch of 24 labeled messages entered as a pull request carrying only the changed `.dvc` pointer:
+
+| Stage | Result |
+|---|---|
+| Quality gate, code-only PR | pass in 5s (git diff short-circuits the heavy steps) |
+| Quality gate, data PR | pass in 56s (OIDC assume, `dvc pull`, full GX suite) |
+| Merge to `main` | `train` fires; dataset hash moves `0e703d3d` to `ce0d529b` |
+| Training job | `retrain-pipeline-ce0d529b-c36d27a` reached `Completed` |
+| Registration | model package version 1, `PendingManualApproval` |
+| Human approval | `Approved`, with the comparison stated in the description |
+
+Merge to registered took under four minutes.
+
+**The candidate scored identically to the previous model on every metric**, and that is the honest
+result rather than a defect. Comparing the two artifacts directly shows the vocabulary grew from 7,714
+to 7,726 terms and the intercept moved from -2.46755088 to -2.47247791, so every coefficient shifted:
+24 rows against 4,459 changed the decision boundary by less than it took to flip any of the 1,115
+holdout predictions. The model is provably different and measurably identical.
+
+That is exactly the case a threshold rule handles badly and a human handles fine, and it is the
+concrete answer to "why not auto-approve when the candidate beats the champion." There was no champion
+to beat, and beating one is not the only question worth asking.
 
 ## Related projects
 
