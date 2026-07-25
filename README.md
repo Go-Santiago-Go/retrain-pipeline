@@ -192,6 +192,74 @@ is scoped to that one execution role and to SageMaker alone, which closes the es
 could pass a more privileged role. The attack prevented is privilege escalation from a compromised CI
 pipeline into the model store.
 
+## Model registry and human approval
+
+A trained artifact in S3 is only weights. It records no evaluation, no lineage, and no sign off, so
+nothing about the object itself can gate promotion. `trainctl register` turns a completed training job
+into a versioned **model package**: an immutable entry in the `retrain-pipeline-models` group that
+binds the artifact to the metrics it earned, the data and commit it came from, and an approval status.
+
+`register` derives the same job name `submit` did, from the same committed pointer and the same commit,
+then asks `DescribeTrainingJob` where the artifact actually landed rather than rebuilding SageMaker's
+output path convention. It refuses to register anything but a `Completed` job. Because `train.py`
+writes `metrics.json` inside `model.tar.gz` and `ModelMetrics` takes an S3 URI rather than numbers, the
+CLI streams that one file out of the tarball and republishes it as `metrics/<job name>.json`. The
+tarball stays the source of truth; the S3 copy is a projection the console can render. The key is the
+job name, not the dataset hash, because metrics describe a run: two commits training on identical data
+produce different scores, and a dataset keyed object would overwrite the numbers a registered package
+already points at.
+
+Registration happens in the Go CLI rather than at the end of the training script on purpose. The
+training container's job is to train and write artifacts; it knows nothing about approval status or
+registries. Governance policy lives in one place, and that place is not the code that touches the data.
+
+### Reviewer runbook
+
+The pipeline proposes. A human disposes. This is what the human checks.
+
+**1. Find the pending version.**
+
+```bash
+aws sagemaker list-model-packages \
+  --model-package-group-name retrain-pipeline-models \
+  --model-approval-status PendingManualApproval
+
+aws sagemaker describe-model-package --model-package-name <model-package-arn>
+```
+
+**2. Read the metrics against the incumbent.** The decision is a comparison, not an absolute judgment.
+Fetch the `ModelMetrics.ModelQuality.Statistics.S3Uri` for both the candidate and the current
+`Approved` version. On this dataset the two error types cost different things: a precision drop junks
+real messages, while a recall drop only lets more spam through. A candidate that trades precision for
+recall is usually the wrong trade here, and it is the reviewer's job to say so.
+
+**3. Verify the lineage resolves.** `CustomerMetadataProperties` carries `dataset_hash`, `git_sha`, and
+`training_job_name`. Each should resolve to something real:
+
+```bash
+git show --stat <git_sha>                      # a real commit on main
+git show <git_sha>:data/train.csv.dvc          # its md5 must equal dataset_hash
+```
+
+If the hash in the pointer at that commit does not match the metadata, the package is not describing
+the data you think it is, and that is a reject regardless of how good the numbers look.
+
+**4. Approve or reject, with a reason.**
+
+```bash
+aws sagemaker update-model-package \
+  --model-package-arn <model-package-arn> \
+  --model-approval-status Approved \
+  --approval-description "f1 0.90 vs champion 0.88, lineage verified against <git_sha>"
+```
+
+The description is the audit trail. An approval with no stated reason is a click, not a decision.
+
+**The gate is enforced, not merely documented.** The CI role holds `CreateModelPackage`,
+`DescribeModelPackage`, and `ListModelPackages`, and deliberately not `UpdateModelPackage`. CI can
+therefore propose a version and read the registry, but it structurally cannot approve one. Promotion
+requires a principal that CI is not.
+
 ## Related projects
 
 Part of a three-repo portfolio covering the model lifecycle on AWS:
