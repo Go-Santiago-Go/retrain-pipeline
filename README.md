@@ -228,18 +228,47 @@ aws sagemaker describe-model-package --model-package-name <model-package-arn>
 ```
 
 **2. Read the metrics against the incumbent.** The decision is a comparison, not an absolute judgment.
-Fetch the `ModelMetrics.ModelQuality.Statistics.S3Uri` for both the candidate and the current
-`Approved` version. On this dataset the two error types cost different things: a precision drop junks
-real messages, while a recall drop only lets more spam through. A candidate that trades precision for
-recall is usually the wrong trade here, and it is the reviewer's job to say so.
-
-**3. Verify the lineage resolves.** `CustomerMetadataProperties` carries `dataset_hash`, `git_sha`, and
-`training_job_name`. Each should resolve to something real:
+Fetch `ModelMetrics.ModelQuality.Statistics.S3Uri` for the candidate and for the current `Approved`
+version:
 
 ```bash
-git show --stat <git_sha>                      # a real commit on main
-git show <git_sha>:data/train.csv.dvc          # its md5 must equal dataset_hash
+aws sagemaker list-model-packages \
+  --model-package-group-name retrain-pipeline-models \
+  --model-approval-status Approved            # the incumbent, if there is one
 ```
+
+On this dataset the two error types cost different things: a precision drop junks real messages, while
+a recall drop only lets more spam through. A candidate that trades precision for recall is usually the
+wrong trade here, and it is the reviewer's job to say so.
+
+**When there is no incumbent**, which is the case for the first version in the group and any time every
+prior version was rejected, there is nothing to compare against and the step still has to mean
+something. Judge the candidate against the documented local baseline instead (accuracy 0.97, precision
+1.00, recall 0.81, F1 0.90) and treat a large divergence in either direction as a reason to look
+closer. Numbers far below it suggest the job trained on the wrong data; numbers suspiciously near
+perfect suggest holdout leakage. Approving a first version is approving a baseline, so say so in the
+description rather than implying a comparison that did not happen.
+
+**Identical metrics are a real outcome, not a bug.** A small batch can shift every coefficient without
+flipping a single holdout prediction, which produces a model that is provably different and measurably
+identical. That is a judgment call: promoting it costs nothing but sets a precedent of approving on
+process rather than evidence.
+
+**3. Verify the lineage resolves.** `CustomerMetadataProperties` carries `dataset_hash`, `git_sha`, and
+`training_job_name`. The chain runs from the registry entry all the way down to bytes, and each hop is
+checkable on its own:
+
+```bash
+git show --stat <git_sha>                      # the commit exists
+git merge-base --is-ancestor <git_sha> main    # and it actually merged through the gate
+git show <git_sha>:data/train.csv.dvc          # its md5 must equal dataset_hash
+git checkout <git_sha> && dvc pull             # the exact bytes that hash names
+md5sum data/train.csv                          # must equal dataset_hash again
+```
+
+The ancestry check is the one worth not skipping. "A real commit" and "a commit that passed review and
+merged" are different claims, and only the second means the data cleared the quality gate. A package
+whose `git_sha` is not reachable from `main` was trained on data that never passed.
 
 If the hash in the pointer at that commit does not match the metadata, the package is not describing
 the data you think it is, and that is a reject regardless of how good the numbers look.
@@ -253,7 +282,9 @@ aws sagemaker update-model-package \
   --approval-description "f1 0.90 vs champion 0.88, lineage verified against <git_sha>"
 ```
 
-The description is the audit trail. An approval with no stated reason is a click, not a decision.
+The description is the audit trail. An approval with no stated reason is a click, not a decision, and
+it should name what was compared: either the incumbent version it beat, or the fact that it is a
+baseline with no incumbent.
 
 **The gate is enforced, not merely documented.** The CI role holds `CreateModelPackage`,
 `DescribeModelPackage`, and `ListModelPackages`, and deliberately not `UpdateModelPackage`. CI can
