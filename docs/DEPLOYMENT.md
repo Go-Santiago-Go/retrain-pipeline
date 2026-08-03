@@ -71,14 +71,14 @@ cd retrain-pipeline
 
 Three things are hardcoded to the original account and repository and must change for a fresh deploy.
 
-**The backend bucket** in `terraform/backend.tf`. Backend configuration is read before variables are
+**The backend bucket** in `infra/backend.tf`. Backend configuration is read before variables are
 evaluated, so it cannot be interpolated and the account number is literal:
 
 ```hcl
 bucket = "retrain-pipeline-tfstate-<your account>"
 ```
 
-**The GitHub identity** in `terraform/variables.tf`. These are interpolated into the CI role's trust
+**The GitHub identity** in `infra/variables.tf`. These are interpolated into the CI role's trust
 policy and are what stop any other repository on GitHub from assuming it. Repositories created after
 2026-07-15 use immutable subject claims carrying numeric IDs, because a released name can be
 re-registered by someone else while an ID cannot:
@@ -98,11 +98,11 @@ There is a chicken-and-egg problem here: the configuration creates the bucket th
 state. So the first apply runs with local state, and the backend is migrated in afterwards.
 
 ```bash
-# Comment out the backend block in terraform/backend.tf first
+# Comment out the backend block in infra/backend.tf first
 make deploy
 
 # Uncomment it, then migrate the local state file into the bucket it just created
-terraform -chdir=terraform init -migrate-state
+terraform -chdir=infra init -migrate-state
 ```
 
 Terraform will ask to copy the existing state; answer yes. Subsequent applies are just `make deploy`.
@@ -146,7 +146,7 @@ it is currently using, and lose track of everything else mid-operation:
 
 ```bash
 # Comment out the backend block, then pull state back down
-terraform -chdir=terraform init -migrate-state
+terraform -chdir=infra init -migrate-state
 
 make destroy
 ```

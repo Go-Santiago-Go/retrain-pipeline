@@ -13,7 +13,7 @@ export
 # CI submits with; see docs/CONVENTIONS.md on why the local pin is newer.
 SKLEARN_IMAGE := 683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.4-2-cpu-py3
 
-TF := terraform -chdir=terraform
+TF := terraform -chdir=infra
 
 .DEFAULT_GOAL := help
 

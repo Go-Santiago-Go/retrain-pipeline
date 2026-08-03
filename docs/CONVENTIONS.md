@@ -49,7 +49,7 @@ has run and can run again.
 The CI role holds `CreateModelPackage`, `DescribeModelPackage`, and `ListModelPackages`, and
 deliberately not `UpdateModelPackage`. Any rewrite that describes the human gate as policy or process
 has weakened the claim: it is enforced by the absence of a permission, and that is what makes it worth
-writing down. If the grant in `terraform/iam_ci.tf` ever changes, this sentence is false.
+writing down. If the grant in `infra/iam_ci.tf` ever changes, this sentence is false.
 
 ## Generated artifacts
 
