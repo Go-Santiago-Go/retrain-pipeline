@@ -159,7 +159,7 @@ make register
 The trust policy's `sub` condition does not match the token's claims, or the job is missing
 `id-token: write` and never got a token. Both produce the same error text. Check the workflow
 permissions block first, since it is the cheaper of the two to rule out, then the numeric owner and
-repo IDs in `terraform/variables.tf`.
+repo IDs in `infra/variables.tf`.
 
 ## Honest constraints
 
@@ -176,8 +176,6 @@ Things this pipeline does not do, stated plainly rather than left for a reviewer
   retrain weekly rather than hourly.
 - **Nothing deploys the approved model.** Approval marks a version promotable; serving it is
   `inference-gateway`'s job, and the handoff between the two is not automated.
-- **The Go tests do not run in CI.** `make test` passes locally and nothing enforces it on a pull
-  request. See the README's `Known gaps and next steps`.
 - **The holdout is frozen, so the metrics are comparable but not unbiased forever.** Every model has
   now been measured against the same 1,115 rows. Enough iterations of judging candidates on one test
   set eventually overfits to it, and this project is nowhere near that point but does not pretend the

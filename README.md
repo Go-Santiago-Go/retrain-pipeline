@@ -1,5 +1,6 @@
 # Retrain Pipeline: CI-Driven Continuous Training, Data Quality Gates, and Human-in-the-Loop Model Governance
 
+[![ci](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/ci.yml)
 [![quality-gate](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/quality-gate.yml/badge.svg)](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/quality-gate.yml)
 [![train](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/train.yml/badge.svg)](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/train.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -309,13 +310,8 @@ case a threshold rule handles badly and a human handles fine. The reviewer's sid
 
 ## What I'd do differently
 
-Four things I would change on a second pass, separate from the scoping calls below. These are
+Three things I would change on a second pass, separate from the scoping calls below. These are
 hindsight, not parked work.
-
-**Wire the Go tests into CI on day one.** `make test` passes locally and nothing enforces it on a pull
-request, which means the test suite is a habit rather than a control. Everything else in this project
-is about the difference between those two things, so leaving the Go tests unenforced is the one
-inconsistency I would not repeat.
 
 **Register the pre-existing model as version 1 before adding data.** The first candidate had no
 incumbent to compare against, which forced the reviewer runbook to grow a whole branch for "when there
@@ -336,12 +332,6 @@ split avoids it for free.
 
 Deliberately out of scope, named rather than hidden. Each has a real answer I would reach for if the
 workload demanded it, and each is a scoping call I can defend.
-
-**No CI runs the Go tests.** There is no `ci.yml` in this repository. `make test` and `make lint` pass
-locally and nothing enforces either on a pull request, so the Go suite is a habit rather than a
-control. That is the one inconsistency I would fix first, because the difference between a habit and a
-control is the entire subject of this project, and the data path gets it right while the code path
-does not.
 
 **One dataset and one model, by design.** `trainctl` reads `data/train.csv.dvc` and
 `data/holdout.csv.dvc` as constants, so a second dataset is a code change rather than a configuration
@@ -388,8 +378,8 @@ a Git tag per dataset version.
 | `training/split_dataset.py` | The one-shot holdout carve, under seed 42. Ran once and must never run again; kept out of `train.py` so a run cannot resplit. |
 | `training/validate.py` | The Great Expectations suite. Exits nonzero on any failed expectation, which is the entire gate mechanism. |
 | `data/` | DVC pointer files only, never the data itself. |
-| `terraform/` | Three buckets, two IAM roles, the model package group, and a data source reading the account-global OIDC provider it deliberately does not own. |
-| `.github/workflows/` | `quality-gate` runs on every PR and branches inside on `git diff`; `train` runs on merges touching `data/**`. The asymmetry is deliberate and is the most counterintuitive decision in the repo. |
+| `infra/` | Three buckets, two IAM roles, the model package group, and a data source reading the account-global OIDC provider it deliberately does not own. |
+| `.github/workflows/` | `ci` builds, vets, and tests the Go CLI; `quality-gate` runs on every PR and branches inside on `git diff`; `train` runs on merges touching `data/**`. The asymmetry between the last two is deliberate and is the most counterintuitive decision in the repo. |
 | `docs/` | Architecture, CLI reference, local development, deployment, operations, conventions. |
 | `Makefile` | Task runner. Same verbs as the other repos in this portfolio; `make help` lists them. |
 

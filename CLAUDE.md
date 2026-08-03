@@ -57,10 +57,6 @@ make validate           # the Great Expectations suite, the same script CI runs
 `buildModelPackageInput`) are pure functions of a params struct so a table test can assert the wiring
 without a client, and `extractFile` takes an `io.Reader` so a test can hand it an in-memory archive.
 
-**No CI workflow runs the Go tests.** There is no `ci.yml` in this repository, so `make test` and
-`make lint` are a habit rather than a control. That is a known gap, named in the README, and it means
-running them locally is not optional.
-
 The two AWS targets bill and are not part of the normal loop:
 
 ```bash
@@ -126,6 +122,6 @@ registration by hand after a permissions failure, without paying to train again.
 | `training/validate.py` | The Great Expectations suite. Exits nonzero on any failed expectation, which is the entire gate mechanism. |
 | `training/split_dataset.py` | The one-shot holdout carve under seed 42. Ran once, must never run again. |
 | `data/` | DVC pointer files only, never the data itself. |
-| `terraform/` | Three buckets, two IAM roles, the model package group, and a data source reading the account-global OIDC provider it deliberately does not own. |
-| `.github/workflows/` | `quality-gate` runs on every PR and branches on `git diff`; `train` runs on merges touching `data/**`. The asymmetry is the most counterintuitive decision in the repo. |
+| `infra/` | Three buckets, two IAM roles, the model package group, and a data source reading the account-global OIDC provider it deliberately does not own. |
+| `.github/workflows/` | `ci` builds, vets, and tests the Go CLI; `quality-gate` runs on every PR and branches on `git diff`; `train` runs on merges touching `data/**`. The asymmetry between the last two is the most counterintuitive decision in the repo. |
 | `Makefile` | Task runner. `make help` lists the targets. |
