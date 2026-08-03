@@ -1,332 +1,409 @@
-# retrain-pipeline
+# Retrain Pipeline: CI-Driven Continuous Training, Data Quality Gates, and Human-in-the-Loop Model Governance
 
-**CI-driven MLOps pipeline with data quality gates and human-in-the-loop model governance.**
+[![quality-gate](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/quality-gate.yml/badge.svg)](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/quality-gate.yml)
+[![train](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/train.yml/badge.svg)](https://github.com/Go-Santiago-Go/retrain-pipeline/actions/workflows/train.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Bad data cannot merge, every model traces back to an exact dataset hash and Git commit, and no model
-is promoted without a human reading the evaluation.
+A model is only as good as the data behind it, and a trained artifact records nothing about what that
+data was. This repository is a CI-driven MLOps pipeline that makes data quality a merge requirement
+and model promotion a human decision, using:
 
-New labeled data enters through a pull request. Great Expectations validates it before the merge can
-happen. DVC versions it with a content hash. A Go CLI (`trainctl`) submits a SageMaker training job
-tagged with the dataset hash and Git SHA, then registers the result in the SageMaker Model Registry
-as `PendingManualApproval` with its eval metrics attached. Nothing ships until a human reads the
-metrics and approves.
+- **Pull requests** as the only path for labeled data, reviewed like a code change
+- **Great Expectations** as unit tests for data, run by **GitHub Actions** and made a required check by branch protection
+- **Six expectations** over schema, label domain, nulls, and length, with the failing one named in a PR report
+- **DVC** holding the dataset Git cannot, a reviewable md5 pointer in the PR and the bytes in **Amazon S3**
+- **The dataset hash** as the model's identity, so a registry entry traces back to the exact rows behind it
+- **SageMaker script mode** running one dual-mode `train.py` unchanged on a laptop and on the managed sklearn image
+- **A derived training job name** as the idempotency mechanism, so SageMaker itself rejects a duplicate run
+- **A frozen holdout** carved once under seed 42, with split logic kept out of `train.py` so nothing can resplit
+- **SageMaker Model Registry** holding every candidate as an immutable version, with its holdout metrics and lineage attached
+- **`PendingManualApproval`** as the default approval status, gated by an IAM action CI deliberately does not hold
+- **A Go CLI** (`trainctl`) the CI runner invokes on merge, over **GitHub OIDC** with no long-lived AWS keys
+- **Two IAM roles** scoped by ARN with no wildcard actions, so a compromised runner cannot touch artifacts
+- **Terraform** for every resource, with no endpoint, NAT gateway, or GPU, so idle cost is cents of S3 storage
 
-> **Status:** the loop is closed and has been demonstrated live, end to end. AWS infrastructure is
-> provisioned in Terraform, the dual-mode training script trains against the frozen holdout, the Great
-> Expectations quality gate is an enforced required check on `main`, DVC versions the dataset in an S3
-> remote, and the `trainctl` CLI submits a SageMaker training job, watches it to completion, and
-> registers the result in the Model Registry as `PendingManualApproval` with its metrics and lineage
-> attached.
->
-> A batch that fails validation was blocked at the gate. A batch that passes was merged, trained job
-> `retrain-pipeline-ce0d529b-c36d27a` to `Completed`, and registered as version 1. A human read the
-> metrics, verified the lineage back to the commit and the dataset hash, and approved it with a stated
-> reason. Nothing in that sequence was simulated.
+Every one of those fires on the path new labeled data takes from pull request to approved model:
 
-## Architecture
+> A contributor runs `dvc push` to store the updated dataset in S3 and opens a PR carrying only its
+> hash → the gate runs `dvc pull` to fetch exactly those bytes back, and Great Expectations tests
+> that dataset against the suite's data quality expectations, blocking the merge if a single one
+> fails → merging names a training job after the data and the commit, so identical inputs can never
+> train twice → SageMaker runs `train.py` on the managed sklearn image, writes the model and its
+> holdout scores into one artifact in S3, then tears the instance down → `trainctl` registers that
+> artifact as a new Model Registry version with its metrics and lineage attached, marked
+> `PendingManualApproval` → a human compares it against the incumbent and approves with a stated
+> reason.
 
-```mermaid
-flowchart TD
-    A[Contributor: new labeled batch<br/>dvc add + dvc push locally] --> B[Pull request<br/>contains .dvc pointer, not data]
-    B --> C[GitHub Actions: quality gate<br/>dvc pull, run Great Expectations suite]
-    C -- suite fails --> D[Check fails, merge blocked<br/>GX report attached to PR]
-    C -- suite passes --> E[Merge to main]
-    E --> F[GitHub Actions: train workflow<br/>OIDC role, no stored AWS keys]
-    F --> G[Go CLI trainctl: submit<br/>CreateTrainingJob, tags = dataset hash + git SHA]
-    G --> H[SageMaker training job<br/>sklearn, ml.m5.large]
-    H --> I[S3: model.tar.gz + metrics.json]
-    F --> J[Go CLI trainctl: register<br/>CreateModelPackage with metrics + lineage]
-    J --> K[SageMaker Model Registry<br/>PendingManualApproval]
-    K --> L[Human review in console<br/>Approve or Reject]
-```
 
-This is the **continuous training** pattern: data and code both enter through Git, validation gates
-the merge, the merge triggers training, and the registry gates promotion. The trigger is CI-driven,
-not event-driven. There is no queue and no event bus in this design.
+## Contents
 
-## Repository layout
-
-| Path | Contents |
+| | |
 |---|---|
-| `terraform/` | Buckets, IAM roles, GitHub OIDC provider, model package group |
-| `training/` | `train.py` (dual-mode local/SageMaker), `split_dataset.py` (one-shot holdout carve), and `validate.py` (the Great Expectations quality-gate suite) |
-| `cmd/trainctl/` | Go CLI: `submit` and `register` |
-| `data/` | DVC pointer files only, never the data itself |
-| `.github/workflows/` | `quality-gate` (every PR; full validation only when data changes) and `train` (on merge to main) |
+| [Demo](#demo) | The full loop executed end to end against real AWS, stage by stage |
+| [The problem](#the-problem) | Why "the model got worse and nobody knows why" is a data problem, not a modeling one |
+| [How it works](#how-it-works) | The two paths and why they trigger differently, the hash that becomes identity, the idempotency mechanism, and where governance lives |
+| [Quickstart](#quickstart) | Clone to a trained model on your laptop, then the gate the way CI runs it |
+| [Trade-offs](#trade-offs) | Every design decision, what it was chosen over, and why |
+| [Results](#results) | Measured metrics, observed pipeline timings, and the run where nothing changed |
+| [What I'd do differently](#what-id-do-differently) | Four things a second pass would change |
+| [Known gaps and next steps](#known-gaps-and-next-steps) | Deliberately out of scope, named rather than hidden |
+| [Repo layout](#repo-layout) · [Documentation](#documentation) | Where each piece lives, and the six deep-dive docs |
 
-## Infrastructure
+## Demo
 
-All AWS resources are defined in Terraform (`terraform/`), with remote state in S3 using native
-lockfile locking (no DynamoDB table). Nothing in this layer bills while idle.
+![Terminal walkthrough in four parts. A data pull request is shown to carry a DVC pointer rather
+than a dataset, so 4,460 rows review as four lines. The Great Expectations suite passes on the
+merged batch, then the rejected batch from PR #4 is pulled back out of S3 and fails with exit 1,
+and the report names the expectation and the one corrupted label out of 4,460 rows. The training
+job named after that dataset hash is shown Completed, and the registry entry carrying the same
+hash is shown Approved, created by the CI role and approved by a human
+user](docs/demo.gif)
 
-| Resource | Purpose |
-|---|---|
-| Three S3 buckets | DVC remote, model artifacts, Terraform state |
-| GitHub OIDC provider | Keyless CI auth; account-global, so referenced (not owned) by this repo |
-| CI IAM role | Assumed by GitHub Actions via OIDC. Starts training jobs, never runs them |
-| SageMaker execution role | Assumed by the training job. Writes artifacts and logs, nothing more |
-| Model package group | Registry container for versioned model packages |
+**Almost nothing in that recording is a command a developer runs.** `dvc pull data/train.csv.dvc`
+and `python training/validate.py data/train.csv` are the `quality-gate` workflow's own steps, run
+on a laptop here only so the gate is watchable. On a real data pull request a contributor's
+involvement ends at `dvc push` and `git push`, and the next thing they see is a green check or a
+red one. The `git checkout fc15046` that swaps in the failing batch stands in for the checkout CI
+performs against the PR head, and it pulls the same bytes from the same S3 remote the workflow
+reads. The report behind the `jq` query is `training/validation-result.json`, which CI uploads as
+the `gx-validation-result` artifact instead of printing, so a blocked merge hands back the
+offending row rather than a stack trace.
 
-**Security posture.** CI authenticates to AWS through GitHub OIDC federation, so there are no
-long-lived AWS keys in GitHub secrets. The role trust policy is scoped to this repository's immutable
-subject claim on `main` and `pull_request`. The two IAM roles are kept separate and least-privilege:
-CI can start training jobs but cannot write model artifacts, and its `iam:PassRole` is scoped to the
-single execution role and to SageMaker alone, closing the privilege-escalation path.
+The two `aws sagemaker` calls are read-only descriptions rather than pipeline steps. `trainctl
+submit` created that training job and `trainctl register` filed that model package, both from the
+`train` workflow over OIDC with no stored keys, and the approval was a human's. The demo queries
+them after the fact because the alternative is watching a four minute training job in a looping
+gif. Recorded against the live dataset and this account, so `ce0d529b` appearing in the pointer,
+in the job name, and in the registry entry is one hash observed three times rather than three
+values that happen to match.
 
-Buckets block public access, use SSE-S3 encryption, and carry lifecycle rules that abort incomplete
-multipart uploads. State is versioned; the two write-once application buckets are not.
-
-## Dataset and training
-
-The dataset is the [UCI SMS Spam Collection](https://archive.ics.uci.edu/dataset/228/sms+spam+collection):
-5,574 real English text messages, each labeled `ham` or `spam`, roughly 87/13. A further 24 hand
-written messages entered later through the pipeline itself, as the labeled batch that exercised the
-gate, the training job, and the registry end to end.
-
-Before any model trains, `training/split_dataset.py` carves a **frozen holdout** once: a stratified 20
-percent split under a fixed seed, written to `data/holdout.csv` and never regenerated. The holdout is
-the fixed ruler every future model is measured against, so metrics stay comparable across retrains and
-no run can leak test data into training. The split logic lives in this one-shot script, not in
-`train.py`, so a training run structurally cannot resplit.
-
-`training/train.py` is **dual-mode**: SageMaker script mode passes data and output locations through
-`SM_CHANNEL_TRAIN` and `SM_MODEL_DIR`, and those default to local paths, so the identical file runs on
-a laptop and in the cloud with no branching. The model stays deliberately boring: a TF-IDF plus
-LogisticRegression `sklearn.Pipeline`, where the single Pipeline is the leakage guard, fitting the
-vectorizer on training data only and reusing it on the holdout. Each run writes `model.joblib` and
-`metrics.json` into the model directory, so in SageMaker they tar into one `model.tar.gz` and the
-metrics travel with the model the registry will grade.
-
-Run it locally:
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r training/requirements.txt
-
-# fetch the raw dataset (gitignored and re-downloadable; the split CSVs are DVC-managed)
-mkdir -p data/raw
-curl -sL "https://archive.ics.uci.edu/static/public/228/sms+spam+collection.zip" -o data/raw/smsspam.zip
-unzip -o data/raw/smsspam.zip -d data/raw/
-
-python training/split_dataset.py   # one-shot; carves the frozen holdout
-python training/train.py           # trains, evaluates, writes metrics.json
-```
-
-The current local baseline on the frozen holdout is accuracy 0.97, precision 1.00, recall 0.81, F1
-0.90. Precision and recall are reported separately because for a spam filter their costs differ: a
-false positive junks a real message, while a false negative merely lets one spam through.
-
-## Data versioning
-
-The dataset is versioned with [DVC](https://dvc.org). Git tracks only small `.dvc` pointer files (an
-MD5 hash, a size, and a path); the CSV bytes live content-addressed in an S3 remote. That hash is the
-dataset's version identity, and it travels to the training job and the model registry as lineage.
-
-The contributor loop is run by a human, locally:
-
-```bash
-# 1. add or replace labeled rows in data/train.csv, then
-
-# 2. re-hash the file and push its bytes to the S3 remote
-dvc add data/train.csv
-dvc push
-
-# 3. commit the pointer, not the data, and open a PR
-git add data/train.csv.dvc
-git commit -m "feat(data): add N labeled messages"
-git push
-```
-
-The PR carries only the changed pointer. CI never runs `dvc add` or `dvc push`; it only ever runs
-`dvc pull` to fetch the exact bytes a hash names, then validates them. Automating `dvc add` in CI
-would mean CI committing to `main`, the anti-pattern this design avoids: humans propose data, the gate
-and a human dispose. Any dataset version is recoverable later in two commands, `git checkout
-dataset-<hash> && dvc pull`.
-
-**The quality gate.** `quality-gate` runs on every pull request. A native `git diff` decides whether
-the PR touches `data/**`: a data PR gets the full validation (assume the CI role via OIDC, `dvc pull`,
-run the Great Expectations suite), while a code-only PR skips straight to a green check. Running on
-every PR rather than filtering by path is deliberate. A path-filtered required check never reports on
-a code-only PR, leaving it unmergeable forever; running always and branching inside keeps the check
-honest for every PR shape. The suite is a required check on `main` with admin enforcement, so a batch
-that fails validation cannot merge.
-
-## Training submission
-
-Merging approved data to `main` triggers the `train` workflow, which authenticates as the CI role
-through OIDC (no stored keys), `dvc pull`s the exact dataset the commit points at, stages the code and
-CSVs into the artifacts bucket, and runs `trainctl submit`.
-
-`trainctl submit` takes three identifiers (`--execution-role`, `--image`, `--bucket`) and derives the
-rest. The dataset hash, read from the `.dvc` pointer, builds both the idempotent job name
-(`retrain-pipeline-<hash8>-<sha7>`) and the immutable input prefix, so the same data and commit always
-resolve to the same job. SageMaker rejects a duplicate name, which is the idempotency guarantee: an
-unchanged dataset and commit cannot launch a second job. The CLI then polls `DescribeTrainingJob`
-until the job reaches a terminal state and returns a nonzero exit on anything but `Completed`, turning
-a failed run into a red CI check.
-
-The container runs the AWS-managed sklearn image (1.4) while local development uses a newer sklearn.
-The TF-IDF plus LogisticRegression APIs are stable across that gap, so the identical `train.py` runs in
-both; `requirements.txt` is deliberately not shipped to the container, so it keeps its pinned runtime.
-
-### Design Q&A
-
-**How does the workflow authenticate to AWS with no credentials in the repo or in secrets?**
-Through GitHub OIDC federation. When the job runs, GitHub Actions mints a short-lived, signed JSON
-Web Token whose claims name this repository and the branch it ran on. The job requests that token by
-declaring `id-token: write`. The `configure-aws-credentials` action hands the token to AWS STS via
-`AssumeRoleWithWebIdentity`. STS verifies the signature against the GitHub OIDC provider registered in
-the account, then checks the CI role's trust policy conditions (this repository, `main`). On a match it
-returns temporary credentials scoped to the job's lifetime. Nothing long-lived is ever stored; the
-trust is federated and minted fresh per run.
-
-**Why derive the training job name from the dataset hash and Git SHA instead of listing existing jobs
-and skipping if one matches?** Because the derived name makes SageMaker itself enforce idempotency.
-The name is a deterministic function of the data and the commit, and SageMaker rejects a duplicate job
-name, so resubmitting the same inputs fails at the service with no extra logic. A check-then-act
-approach (list jobs, skip if found) carries a time-of-check-to-time-of-use race: two concurrent merges
-could both see no match and both submit. It also costs an extra API call and more code. Pushing the
-uniqueness check to the server is atomic, race-free, and simpler, and the name doubles as human-readable
-provenance for which data and commit produced the job.
-
-**Why two IAM roles rather than one?** Separation of privilege. The CI role only needs to start jobs
-and pass the execution role to SageMaker; the execution role is what the job assumes to read input and
-write model artifacts. A single combined role would hand anyone who could trigger CI, or who
-compromised the runner, the union of both: the power to launch jobs and to read and write the
-model-artifacts bucket directly. Splitting them means a compromised runner can only launch a job that
-runs as the tightly scoped execution role, never touch artifacts itself. The CI role's `iam:PassRole`
-is scoped to that one execution role and to SageMaker alone, which closes the escalation path where CI
-could pass a more privileged role. The attack prevented is privilege escalation from a compromised CI
-pipeline into the model store.
-
-## Model registry and human approval
-
-A trained artifact in S3 is only weights. It records no evaluation, no lineage, and no sign off, so
-nothing about the object itself can gate promotion. `trainctl register` turns a completed training job
-into a versioned **model package**: an immutable entry in the `retrain-pipeline-models` group that
-binds the artifact to the metrics it earned, the data and commit it came from, and an approval status.
-
-`register` derives the same job name `submit` did, from the same committed pointer and the same commit,
-then asks `DescribeTrainingJob` where the artifact actually landed rather than rebuilding SageMaker's
-output path convention. It refuses to register anything but a `Completed` job. Because `train.py`
-writes `metrics.json` inside `model.tar.gz` and `ModelMetrics` takes an S3 URI rather than numbers, the
-CLI streams that one file out of the tarball and republishes it as `metrics/<job name>.json`. The
-tarball stays the source of truth; the S3 copy is a projection the console can render. The key is the
-job name, not the dataset hash, because metrics describe a run: two commits training on identical data
-produce different scores, and a dataset keyed object would overwrite the numbers a registered package
-already points at.
-
-Registration happens in the Go CLI rather than at the end of the training script on purpose. The
-training container's job is to train and write artifacts; it knows nothing about approval status or
-registries. Governance policy lives in one place, and that place is not the code that touches the data.
-
-### Reviewer runbook
-
-The pipeline proposes. A human disposes. This is what the human checks.
-
-**1. Find the pending version.**
-
-```bash
-aws sagemaker list-model-packages \
-  --model-package-group-name retrain-pipeline-models \
-  --model-approval-status PendingManualApproval
-
-aws sagemaker describe-model-package --model-package-name <model-package-arn>
-```
-
-**2. Read the metrics against the incumbent.** The decision is a comparison, not an absolute judgment.
-Fetch `ModelMetrics.ModelQuality.Statistics.S3Uri` for the candidate and for the current `Approved`
-version:
-
-```bash
-aws sagemaker list-model-packages \
-  --model-package-group-name retrain-pipeline-models \
-  --model-approval-status Approved            # the incumbent, if there is one
-```
-
-On this dataset the two error types cost different things: a precision drop junks real messages, while
-a recall drop only lets more spam through. A candidate that trades precision for recall is usually the
-wrong trade here, and it is the reviewer's job to say so.
-
-**When there is no incumbent**, which is the case for the first version in the group and any time every
-prior version was rejected, there is nothing to compare against and the step still has to mean
-something. Judge the candidate against the documented local baseline instead (accuracy 0.97, precision
-1.00, recall 0.81, F1 0.90) and treat a large divergence in either direction as a reason to look
-closer. Numbers far below it suggest the job trained on the wrong data; numbers suspiciously near
-perfect suggest holdout leakage. Approving a first version is approving a baseline, so say so in the
-description rather than implying a comparison that did not happen.
-
-**Identical metrics are a real outcome, not a bug.** A small batch can shift every coefficient without
-flipping a single holdout prediction, which produces a model that is provably different and measurably
-identical. That is a judgment call: promoting it costs nothing but sets a precedent of approving on
-process rather than evidence.
-
-**3. Verify the lineage resolves.** `CustomerMetadataProperties` carries `dataset_hash`, `git_sha`, and
-`training_job_name`. The chain runs from the registry entry all the way down to bytes, and each hop is
-checkable on its own:
-
-```bash
-git show --stat <git_sha>                      # the commit exists
-git merge-base --is-ancestor <git_sha> main    # and it actually merged through the gate
-git show <git_sha>:data/train.csv.dvc          # its md5 must equal dataset_hash
-git checkout <git_sha> && dvc pull             # the exact bytes that hash names
-md5sum data/train.csv                          # must equal dataset_hash again
-```
-
-The ancestry check is the one worth not skipping. "A real commit" and "a commit that passed review and
-merged" are different claims, and only the second means the data cleared the quality gate. A package
-whose `git_sha` is not reachable from `main` was trained on data that never passed.
-
-If the hash in the pointer at that commit does not match the metadata, the package is not describing
-the data you think it is, and that is a reject regardless of how good the numbers look.
-
-**4. Approve or reject, with a reason.**
-
-```bash
-aws sagemaker update-model-package \
-  --model-package-arn <model-package-arn> \
-  --model-approval-status Approved \
-  --approval-description "f1 0.90 vs champion 0.88, lineage verified against <git_sha>"
-```
-
-The description is the audit trail. An approval with no stated reason is a click, not a decision, and
-it should name what was compared: either the incumbent version it beat, or the fact that it is a
-baseline with no incumbent.
-
-**The gate is enforced, not merely documented.** The CI role holds `CreateModelPackage`,
-`DescribeModelPackage`, and `ListModelPackages`, and deliberately not `UpdateModelPackage`. CI can
-therefore propose a version and read the registry, but it structurally cannot approve one. Promotion
-requires a principal that CI is not.
-
-### The demonstrated run
-
-A batch of 24 labeled messages entered as a pull request carrying only the changed `.dvc` pointer:
+The loop has been demonstrated live, end to end. A batch of 24 hand written labeled messages entered
+as a pull request carrying only the changed `.dvc` pointer:
 
 | Stage | Result |
 |---|---|
-| Quality gate, code-only PR | pass in 5s (git diff short-circuits the heavy steps) |
-| Quality gate, data PR | pass in 56s (OIDC assume, `dvc pull`, full GX suite) |
+| Quality gate, code-only PR | pass in 5s, `git diff` short-circuits the heavy steps |
+| Quality gate, data PR | pass in 56s: OIDC assume, `dvc pull`, full Great Expectations suite |
+| A batch that violates the contract | check red, merge blocked, per-expectation report attached |
 | Merge to `main` | `train` fires; dataset hash moves `0e703d3d` to `ce0d529b` |
 | Training job | `retrain-pipeline-ce0d529b-c36d27a` reached `Completed` |
 | Registration | model package version 1, `PendingManualApproval` |
 | Human approval | `Approved`, with the comparison stated in the description |
 
-Merge to registered took under four minutes.
+Merge to registered took under four minutes. Nothing in that sequence was simulated.
 
-**The candidate scored identically to the previous model on every metric**, and that is the honest
-result rather than a defect. Comparing the two artifacts directly shows the vocabulary grew from 7,714
-to 7,726 terms and the intercept moved from -2.46755088 to -2.47247791, so every coefficient shifted:
-24 rows against 4,459 changed the decision boundary by less than it took to flip any of the 1,115
-holdout predictions. The model is provably different and measurably identical.
+## The problem
 
-That is exactly the case a threshold rule handles badly and a human handles fine, and it is the
-concrete answer to "why not auto-approve when the candidate beats the champion." There was no champion
-to beat, and beating one is not the only question worth asking.
+A model in production gets worse. Someone asks which data it was trained on, and the honest answer is
+that nobody knows: the training set is a CSV on a laptop that has been appended to a few times, the
+job that produced the model ran three weeks ago, and the artifact in S3 is a tarball with a timestamp
+for a name.
 
-## Related projects
+That is not a modeling problem. Every piece of it is a supply chain problem: nothing validated the
+data, nothing bound the artifact to its inputs, and nothing stood between a worse model and
+production.
 
-Part of a three-repo portfolio covering the model lifecycle on AWS:
+What a fix has to get right, and what each of those requirements costs if you get it wrong:
 
-- [`go-rag-api`](https://github.com/Go-Santiago-Go/go-rag-api) — retrieval
-- [`infer-gateway`](https://github.com/Go-Santiago-Go/infer-gateway) — serving and scaling
-- **`retrain-pipeline`** — training and governance (this repo)
+- **Validate at the merge, not at the training run.** A corrupted training set does not throw an
+  error. It trains fine and reports a number that looks fine, so the only cheap place to catch it is
+  before it lands.
+- **Review data the way code is reviewed.** Labeled rows come from humans, and humans mislabel, paste
+  duplicates, and leave empty strings. A batch that no second person looked at is an unreviewed commit
+  with a different file extension.
+- **Make the data's content its own identity.** A name, a path, and a timestamp all drift. A content
+  hash cannot: it is either the bytes that trained the model or it is not.
+- **Ship metrics inside the artifact.** Scores recorded beside the weights get separated in transit.
+  A model whose evaluation lives in a log line somebody has to find is a model nobody can judge.
+- **Make promotion an act, not a default.** Auto-promotion means the first person to read the metrics
+  is whoever notices the regression, and a threshold rule is a guess about a distribution nobody has
+  looked at.
+- **Enforce the gate with a permission, not a policy.** A documented rule that CI must not promote is
+  a convention. A missing IAM action is a control, and only one of the two survives someone being in
+  a hurry.
+
+This repository does that in the cheapest way available: data enters through the review process code
+already uses, the dataset's content hash becomes the identity everything downstream carries, and
+promotion requires a human who has to type a reason.
+
+## How it works
+
+```mermaid
+flowchart TD
+    A[Contributor<br/>dvc add, dvc push] -->|"CSV bytes"| B[(S3: DVC remote)]
+    A -->|".dvc pointer, not the data"| C[Pull request]
+    C -->|"md5 hash of the batch"| D[quality-gate workflow<br/>dvc pull, Great Expectations]
+    B -->|"the exact bytes that hash names"| D
+    D -->|"suite fails: report attached"| E[Merge blocked]
+    D -->|"suite passes"| F[Merge to main]
+    F -->|"dataset hash + git SHA"| G[train workflow<br/>OIDC, no stored keys]
+    G -->|"derived job name"| H[trainctl submit<br/>CreateTrainingJob]
+    H -->|"sklearn container, ml.m5.large"| I[SageMaker training job]
+    I -->|"model.tar.gz + metrics.json"| J[(S3: model artifacts)]
+    J -->|"artifact URI + metrics"| K[trainctl register<br/>CreateModelPackage]
+    K -->|"PendingManualApproval"| L[Model Registry]
+    L -->|"human reads metrics and lineage"| M[Approved or Rejected]
+```
+
+Edges carry what moves between stages: a pointer, the bytes it names, a hash, a tarball, an approval
+status.
+
+This is the **continuous training** pattern: data and code both enter through Git, validation gates
+the merge, the merge triggers training, and the registry gates promotion. The trigger is CI-driven,
+not event-driven. There is no queue and no event bus in this design.
+
+Five ideas carry the design, each covered in depth in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md):
+
+**The data path and the training path fail differently.** The data path runs on every PR and its
+failure mode is a bad merge. The training path runs after a merge and its failure mode is cost. That
+asymmetry is why `quality-gate` has no path filter and branches internally on `git diff`, while
+`train` does have one: a path-filtered required check never reports on a code-only PR and leaves it
+unmergeable forever, but a post-merge job that nothing blocks on can filter safely.
+
+**The dataset hash is the version identity.** Git tracks a pointer holding an md5; S3 holds the bytes.
+That hash names the immutable input prefix, forms half the job name, rides in as both a tag and a
+hyperparameter, and lands in the model package metadata, so a registry entry walks back to bytes in
+five checkable hops.
+
+**The job name is the idempotency mechanism.** `retrain-pipeline-<hash8>-<sha7>` is a deterministic
+function of the data and the commit, and SageMaker rejects a duplicate name, so resubmitting identical
+inputs fails at the service with no extra logic. A check-then-act existence test would carry a
+time-of-check-to-time-of-use race that this does not.
+
+**Two leakage guards, one frozen and one structural.** A stratified holdout was carved once under seed
+42 and is DVC-tracked like any other data, and `train.py` contains no split logic at all, so a run
+cannot resplit however it is invoked. Inside the model, a single sklearn `Pipeline` fits the
+vectorizer on the training fold only.
+
+**CI can propose a model and cannot promote one.** Governance sits in the CLI rather than the training
+container, which knows nothing about approval status. `trainctl register` binds an artifact to its
+metrics and its lineage and files it as `PendingManualApproval`. The CI role holds
+`CreateModelPackage` and deliberately not `UpdateModelPackage`, so the gate is enforced by an absent
+permission rather than by policy.
+
+| Subcommand | What it does |
+|---|---|
+| `trainctl submit` | Derives the job name from the dataset hash and short SHA, calls `CreateTrainingJob`, and polls `DescribeTrainingJob` to a terminal state so a failed job turns the check red rather than passing silently |
+| `trainctl register` | Asks the service where the artifact actually landed, streams `metrics.json` out of the tarball, and files a model package version as `PendingManualApproval` with the dataset hash and commit attached |
+
+Both derive the job name independently from the same two inputs, so CI never passes a job name between
+steps and cannot get it wrong. Full flag reference, derived S3 paths, timeouts, and exit codes are in
+[docs/CLI.md](docs/CLI.md).
+
+Deployed, this is three S3 buckets, two IAM roles, and a model package group, provisioned by one
+Terraform stack and reached over GitHub OIDC with no long-lived keys. There is no server, no endpoint,
+and nothing that bills while idle, which is why there is no second diagram here showing running
+infrastructure: between merges, this pipeline is a set of permissions and buckets. What Terraform
+provisions and how to stand it up are in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+## Quickstart
+
+The whole training loop runs locally. Only fetching the dataset touches AWS, and
+[docs/LOCAL_DEV.md](docs/LOCAL_DEV.md) has a path around that if you have no access to the remote.
+
+```bash
+git clone https://github.com/Go-Santiago-Go/retrain-pipeline.git
+cd retrain-pipeline
+
+python -m venv .venv && source .venv/bin/activate
+make install     # Python dependencies plus dvc[s3]
+make data        # dvc pull: the dataset and the frozen holdout
+make train       # train against the holdout, write model.joblib and metrics.json
+```
+
+```json
+{
+  "accuracy": 0.9748878923766816,
+  "precision": 1.0,
+  "recall": 0.8120805369127517,
+  "f1": 0.8962962962962963
+}
+```
+
+Then run the gate the way CI runs it, and the Go test suite:
+
+```bash
+make validate    # the Great Expectations suite, exits nonzero on any failed expectation
+make test        # job name derivation, request wiring, S3 URI parsing, tar extraction
+```
+
+`make help` lists the rest: `build`, `lint`, `outputs`, the `submit` and `register` pair that drives
+SageMaker, and `deploy` and `destroy`. The environment variables `train.py` reads, a path that works
+with no AWS access at all, and why there is deliberately no `make split` are in
+[docs/LOCAL_DEV.md](docs/LOCAL_DEV.md). To stand the AWS half up yourself, see
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+## Trade-offs
+
+I optimized every choice below for one constraint: the simplest mechanism that makes the guarantee
+real, reaching for a service or a moving part only where the guarantee genuinely needs one. Several of
+these are deliberately less capable than the alternative, because the thing being demonstrated is the
+governance path rather than the model.
+
+| Decision | Choice | Why | Also considered |
+|---|---|---|---|
+| Idempotency | Derived job name, uniqueness enforced by SageMaker | Atomic and race-free, and the name doubles as human-readable provenance | List jobs and skip if one matches |
+| Dataset versioning | DVC pointers in Git, bytes in S3 | A data PR is a few changed lines rather than thousands of rows, and the repo does not grow without bound | Committing CSVs directly, Git LFS |
+| Who runs `dvc add` | A human, locally; CI only ever pulls | Automating it means CI committing to `main`, the anti-pattern this design exists to avoid | A CI step that adds and pushes |
+| Gate trigger | No path filter, branch inside on `git diff` | A path-filtered required check never reports on a code-only PR, so the PR is unmergeable forever | `paths: data/**` on the workflow |
+| Train trigger | Path filter on `data/**` | Nothing blocks on a post-merge job, so filtering deadlocks nothing, and a training job bills | Running on every merge |
+| AWS identity | Two IAM roles, `iam:PassRole` scoped to one role and one service | A compromised runner can launch a job as the tightly scoped execution role but never touch artifacts directly | One combined role |
+| Registration owner | The Go CLI, after the job completes | The training container should not know what a registry or an approval status is | A `CreateModelPackage` call at the end of `train.py` |
+| Metrics object key | The training job name | Metrics describe a run, so a dataset-keyed object would overwrite numbers a registered package already points at | The dataset hash |
+| Training image | AWS-managed sklearn, script mode | No image to build, push, scan, or keep patched, and the version gap is one TF-IDF and LogisticRegression are stable across | A custom training image in ECR |
+| The model | TF-IDF + LogisticRegression | The model is a payload for the governance machinery, and a better classifier would prove nothing this project is about | Anything more capable |
+| Promotion | Human approval, enforced by an absent IAM action | A threshold is a guess about a distribution nobody has looked at, and it handles the identical-metrics case badly | Auto-promote above a threshold |
+| Terraform layout | One stack | Nothing bills at rest, so there is no billable stack to destroy between sessions | Bootstrap plus app stacks |
+| State locking | S3 native, `use_lockfile = true` | One less resource to provision and pay for, now that S3 does conditional writes | A DynamoDB lock table |
+
+The pattern under all of it is that a guarantee should be structural rather than procedural. The
+uniqueness check lives in SageMaker, the leakage guard lives in a script that training does not
+import, and the approval gate lives in an IAM policy with a permission missing from it. Each of those
+could have been a documented rule instead, and each would then hold only as long as everyone
+remembered it.
+
+Go with aws-sdk-go-v2 for the CLI, Python with scikit-learn for training, DVC for dataset versioning,
+Great Expectations for the gate, SageMaker Training and Model Registry for the cloud half, and
+Terraform and GitHub Actions to provision and drive it.
+
+## Results
+
+**Measured**
+
+| | |
+|---|---|
+| Accuracy | 0.9749 |
+| Precision | 1.0000 |
+| Recall | 0.8121 |
+| F1 | 0.8963 |
+
+Measured against the frozen holdout of 1,115 rows, so the numbers stay comparable across every
+retrain rather than against a fresh split. Precision and recall stay separate because their costs differ: a
+false positive junks a real message, while a false negative merely lets one spam through, and a single
+headline number would hide exactly the trade a reviewer needs to see. Reproduce with `make train`
+([how](docs/LOCAL_DEV.md)).
+
+**Observed.** Timings from the demonstrated run, which are observations of specific GitHub Actions
+runs rather than benchmarks, since a hosted runner is not a controlled environment:
+
+| Stage | Observed |
+|---|---|
+| Quality gate, code-only PR | 5s |
+| Quality gate, data PR | 56s |
+| Merge to registered model package | under 4 minutes |
+
+Demonstrated end to end, not just locally: a 24-row batch entered as a pull request, the gate passed,
+the merge fired `train`, job `retrain-pipeline-ce0d529b-c36d27a` reached `Completed`, `register` filed
+version 1 as `PendingManualApproval`, and a human approved it with the comparison stated. Nothing in
+that sequence was simulated. This repo is a pipeline rather than a service, so there is no URL to
+publish and nothing left running between merges.
+
+That run also produced the most useful result in the project: **the candidate scored identically to
+the previous model on every metric.** Comparing the artifacts directly, the vocabulary grew from 7,714
+to 7,726 terms and the intercept moved from -2.46755088 to -2.47247791, so every coefficient shifted.
+24 new rows against 4,459 moved the decision boundary by less than it took to flip any of the 1,115
+holdout predictions. The model is provably different and measurably identical, which is exactly the
+case a threshold rule handles badly and a human handles fine. The reviewer's side of that call is in
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+## What I'd do differently
+
+Four things I would change on a second pass, separate from the scoping calls below. These are
+hindsight, not parked work.
+
+**Wire the Go tests into CI on day one.** `make test` passes locally and nothing enforces it on a pull
+request, which means the test suite is a habit rather than a control. Everything else in this project
+is about the difference between those two things, so leaving the Go tests unenforced is the one
+inconsistency I would not repeat.
+
+**Register the pre-existing model as version 1 before adding data.** The first candidate had no
+incumbent to compare against, which forced the reviewer runbook to grow a whole branch for "when there
+is no incumbent." Registering the baseline first would have made the very first approval a real
+comparison and left the runbook simpler.
+
+**Take the dataset pointer path as a flag rather than hardcoding it.** `trainctl` reads
+`data/train.csv.dvc` and `data/holdout.csv.dvc` as constants. That is correct for one model, but it
+means a second dataset is a code change rather than a configuration change, and the fix costs two
+flags.
+
+**Split the Terraform into two stacks anyway.** One stack seemed right because nothing bills at rest,
+but it created the chicken-and-egg where the configuration owns the bucket holding its own state, and
+the first apply plus migration dance is now a documented step. The sibling repos' bootstrap-plus-app
+split avoids it for free.
+
+## Known gaps and next steps
+
+Deliberately out of scope, named rather than hidden. Each has a real answer I would reach for if the
+workload demanded it, and each is a scoping call I can defend.
+
+**No CI runs the Go tests.** There is no `ci.yml` in this repository. `make test` and `make lint` pass
+locally and nothing enforces either on a pull request, so the Go suite is a habit rather than a
+control. That is the one inconsistency I would fix first, because the difference between a habit and a
+control is the entire subject of this project, and the data path gets it right while the code path
+does not.
+
+**One dataset and one model, by design.** `trainctl` reads `data/train.csv.dvc` and
+`data/holdout.csv.dvc` as constants, so a second dataset is a code change rather than a configuration
+change. Supporting more would change the CLI's shape and not just its flags: the job name derivation,
+the S3 prefixes, and the model package group would each need a dataset dimension. For a pipeline that
+trains one model against one frozen holdout, that generality is cost with no buyer.
+
+**The expectation suite is deliberately small.** Six expectations cover the contract that has actually
+been violated: exact schema, label domain, nulls on both columns, text length, and a row count floor.
+There is no distributional check and no duplicate-row check. Expanding the suite before something
+breaks is guessing at which failure comes next, and an expectation that has never fired is maintenance
+with no evidence behind it.
+
+**The holdout is frozen, so it erodes slowly.** Every model is judged against the same 1,115 rows,
+which is what keeps metrics comparable across retrains and is also what limits them. Enough candidates
+judged against one test set eventually overfits the selection process to that set, even though no
+single training run ever sees it. This project is nowhere near that point, and rotating the holdout
+would trade comparability for freshness, which is the wrong trade at this scale.
+
+**Nothing deploys the approved model.** Approval marks a version promotable and stops there. Serving
+it is `inference-gateway`'s job and the handoff between the two repositories is manual. Automating it
+would mean the registry triggering a deployment, which is a second pipeline with its own rollback
+story rather than an extension of this one.
+
+**No drift detection and no scheduled retraining.** Retraining fires on a data merge and nothing else.
+Detecting distribution shift means monitoring production inference, which this repository does not
+own. A scheduled retrain on unchanged data would derive a job name that already exists and be rejected
+by the idempotency mechanism, which is correct behavior rather than a limitation.
+
+**No model card and no fairness evaluation.** For a spam classifier trained on a public research
+corpus, the governance story that matters is lineage and human approval. A model making decisions
+about people would need documented intended use, subgroup performance, and a bias review before any of
+this counted as governance.
+
+Also parked: a feature store, a multi-environment split between staging and production registries, and
+a Git tag per dataset version.
+
+## Repo layout
+
+| Path | Contents |
+|---|---|
+| `cmd/trainctl/` | The Go CLI. `submit` and `register` are the two subcommands; `name.go` derives the idempotent job name, and the request builders are pure functions so a table test can assert the wiring without AWS. |
+| `training/train.py` | Dual-mode training. Reads `SM_CHANNEL_TRAIN` and `SM_MODEL_DIR`, defaults them to local paths, and writes `metrics.json` beside the model so the scores travel inside the artifact. |
+| `training/split_dataset.py` | The one-shot holdout carve, under seed 42. Ran once and must never run again; kept out of `train.py` so a run cannot resplit. |
+| `training/validate.py` | The Great Expectations suite. Exits nonzero on any failed expectation, which is the entire gate mechanism. |
+| `data/` | DVC pointer files only, never the data itself. |
+| `terraform/` | Three buckets, two IAM roles, the model package group, and a data source reading the account-global OIDC provider it deliberately does not own. |
+| `.github/workflows/` | `quality-gate` runs on every PR and branches inside on `git diff`; `train` runs on merges touching `data/**`. The asymmetry is deliberate and is the most counterintuitive decision in the repo. |
+| `docs/` | Architecture, CLI reference, local development, deployment, operations, conventions. |
+| `Makefile` | Task runner. Same verbs as the other repos in this portfolio; `make help` lists them. |
+
+## Documentation
+
+| Doc | What is in it |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The two paths and why they are triggered differently, the hash as identity, the idempotency mechanism, both leakage guards, and where the governance boundary sits |
+| [docs/CLI.md](docs/CLI.md) | `trainctl` reference: both subcommands, every flag, the values each derives rather than takes, and exit codes |
+| [docs/LOCAL_DEV.md](docs/LOCAL_DEV.md) | Clone to a trained model, the no-AWS path, the environment variables `train.py` reads, and why there is no `make split` |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | What gets provisioned, the SageMaker quota that blocks everything, the state migration, branch protection, and teardown |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | The reviewer runbook, cost, the failure modes and the command that diagnoses each, and honest constraints |
+| [docs/CONVENTIONS.md](docs/CONVENTIONS.md) | How the docs are structured, and the accuracy guards every claim in them has to survive |
+
+## License
+
+MIT. See [LICENSE](LICENSE).
